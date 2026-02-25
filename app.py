@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Tuple
 
@@ -11,31 +12,32 @@ from pydantic import BaseModel, Field
 from pyproj import Transformer
 
 
-# =========================
+# ============================================================
 # CONFIG
-# =========================
-# Metti il file Excel nella repo (es: ./data/spettri2008.xls)
-XLS_PATH = "./data/spettri2008.xls"
+# ============================================================
+# Excel messo NELLA ROOT della repository (stesso livello di app.py)
+XLS_PATH = "./spettri2008.xls"
 
 LAT_COL = "LAT"
 LON_COL = "LON"
 
-# Distanze in metri (Italia): WGS84 -> UTM32N
+# Distanze in metri: WGS84 -> UTM32N (ok per gran parte Italia)
 PROJ_METERS = ("EPSG:4326", "EPSG:32632")
 
-# Interpolazione spaziale
+# Parametri interpolazione spaziale
 K_NEIGHBORS = 4
 IDW_POWER = 2.0
 
-# Unità ag nel file: FISSO come richiesto
-AG_UNIT = "ms2"  # m/s^2 => ag[g] = ag[m/s^2] / 9.81
+# Unità ag nel file
+AG_UNIT = "ms2"  # file in m/s^2 => ag[g] = ag[m/s^2]/9.81
+G_STD = 9.81
 
-
-# =========================
-# TR disponibili + colonne (0-based pandas)
-# =========================
+# TR disponibili nel dataset
 TR_AVAILABLE = [30, 50, 72, 101, 140, 201, 475, 975, 2475]
 
+# Mappatura TR -> colonne Excel (1-based) fornite da te:
+# TR 30: ag col 5; F0 col 6; Tc col 7, ecc.
+# Convertiamo in 0-based per pandas.iat
 TR_TO_COLS_0B: Dict[int, Tuple[int, int, int]] = {
     30:  (5 - 1, 6 - 1, 7 - 1),
     50:  (8 - 1, 9 - 1, 10 - 1),
@@ -48,15 +50,17 @@ TR_TO_COLS_0B: Dict[int, Tuple[int, int, int]] = {
     2475:(29 - 1, 30 - 1, 31 - 1),
 }
 
-# Normativa: CU e PVR
+# CU per classe d'uso
 CU_BY_CLASS = {"I": 0.7, "II": 1.0, "III": 1.5, "IV": 2.0}
+
+# PVR per stati limite
 PVR_BY_STATE = {"SLO": 0.81, "SLD": 0.63, "SLV": 0.10, "SLC": 0.05}
 STATE_ORDER = ["SLO", "SLD", "SLV", "SLC"]
 
 
-# =========================
-# Models (input)
-# =========================
+# ============================================================
+# INPUT MODEL
+# ============================================================
 class SeismicRequestItem(BaseModel):
     lat: float = Field(..., description="Latitude WGS84")
     lon: float = Field(..., description="Longitude WGS84")
@@ -67,9 +71,9 @@ class SeismicRequestItem(BaseModel):
         populate_by_name = True
 
 
-# =========================
-# Data structures
-# =========================
+# ============================================================
+# DATASTRUCTS
+# ============================================================
 @dataclass(frozen=True)
 class NeighborPoint:
     idx: int
@@ -78,13 +82,15 @@ class NeighborPoint:
     dist_m: float
 
 
-# =========================
-# Helpers
-# =========================
+# ============================================================
+# MATH HELPERS
+# ============================================================
 def ag_to_g(ag_raw: float) -> float:
+    """Converte ag dal file (m/s^2) in [g]."""
     if AG_UNIT.lower() == "ms2":
-        return float(ag_raw) / 9.81
-    raise ValueError("AG_UNIT fissato a 'ms2' in questo servizio.")
+        return float(ag_raw) / G_STD
+    # (qui siamo fissi su ms2 come richiesto)
+    return float(ag_raw)
 
 
 def compute_VR(vn: float, cu: float) -> float:
@@ -92,10 +98,17 @@ def compute_VR(vn: float, cu: float) -> float:
 
 
 def compute_TR(vr: float, pvr: float) -> float:
+    # TR = -VR / ln(1 - PVR)
     return -float(vr) / math.log(1.0 - float(pvr))
 
 
 def idw(values: np.ndarray, distances: np.ndarray, p: float = 2.0) -> Tuple[float, np.ndarray]:
+    """
+    Inverse Distance Weighting:
+      w_i = 1/(d_i^p)
+      w_norm = w_i / sum(w_i)
+      v = sum(w_norm * v_i)
+    """
     eps = 1e-9
     distances = np.asarray(distances, dtype=float)
     values = np.asarray(values, dtype=float)
@@ -113,6 +126,7 @@ def linear_interp(x: float, x0: float, x1: float, y0: float, y1: float) -> float
 
 
 def bracket_TR(tr: float) -> Tuple[int, int]:
+    """Trova TR_low e TR_high nel set disponibile."""
     tr = float(tr)
     if tr <= TR_AVAILABLE[0]:
         return TR_AVAILABLE[0], TR_AVAILABLE[0]
@@ -126,18 +140,35 @@ def bracket_TR(tr: float) -> Tuple[int, int]:
     return TR_AVAILABLE[-1], TR_AVAILABLE[-1]
 
 
-# =========================
-# Engine (loads Excel once)
-# =========================
+# ============================================================
+# ENGINE
+# ============================================================
 class SeismicEngine:
     def __init__(self, xls_path: str):
-        self.df = pd.read_excel(xls_path)
+        # 1) check file
+        if not os.path.exists(xls_path):
+            raise FileNotFoundError(f"Excel not found at path: {xls_path}")
 
-        if LAT_COL not in self.df.columns or LON_COL not in self.df.columns:
-            raise ValueError(f"Non trovo colonne {LAT_COL}/{LON_COL}. Colonne: {list(self.df.columns)}")
+        # 2) force engine
+        ext = os.path.splitext(xls_path)[1].lower()
+        if ext == ".xls":
+            df = pd.read_excel(xls_path, engine="xlrd")
+        elif ext == ".xlsx":
+            df = pd.read_excel(xls_path, engine="openpyxl")
+        else:
+            # fallback
+            df = pd.read_excel(xls_path, engine="xlrd")
 
+        # 3) validate columns
+        if LAT_COL not in df.columns or LON_COL not in df.columns:
+            raise ValueError(f"Missing {LAT_COL}/{LON_COL}. Columns: {list(df.columns)}")
+
+        self.df = df
+
+        # 4) projection
         self.proj = Transformer.from_crs(PROJ_METERS[0], PROJ_METERS[1], always_xy=True)
 
+        # 5) clean coords
         lats = pd.to_numeric(self.df[LAT_COL], errors="coerce").to_numpy()
         lons = pd.to_numeric(self.df[LON_COL], errors="coerce").to_numpy()
         valid = np.isfinite(lats) & np.isfinite(lons)
@@ -146,11 +177,12 @@ class SeismicEngine:
             lats = lats[valid]
             lons = lons[valid]
 
+        # 6) precompute node coords in meters
         x_nodes, y_nodes = self.proj.transform(lons, lats)
         self.x_nodes = np.asarray(x_nodes, dtype=float)
         self.y_nodes = np.asarray(y_nodes, dtype=float)
 
-    def neighbors_4(self, lat: float, lon: float, k: int = 4) -> List[NeighborPoint]:
+    def neighbors_k(self, lat: float, lon: float, k: int = 4) -> List[NeighborPoint]:
         x0, y0 = self.proj.transform(lon, lat)
         d = np.hypot(self.x_nodes - x0, self.y_nodes - y0)
 
@@ -184,8 +216,8 @@ class SeismicEngine:
         return {
             "TR": tr,
             "ag_g": ag_to_g(ag_raw_i),
-            "F0": f0_i,
-            "Tc_star": tc_i,
+            "F0": float(f0_i),
+            "Tc_star": float(tc_i),
             "weights": w.tolist(),
         }
 
@@ -206,7 +238,7 @@ class SeismicEngine:
                 "Tc_star": one["Tc_star"],
             }
 
-        # interpolate between bracketing TRs
+        # bracketing TRs
         tr_low, tr_high = bracket_TR(tr_target)
         low = self._spatial_at_TR_discrete(neighbors, tr_low)
         high = self._spatial_at_TR_discrete(neighbors, tr_high)
@@ -235,31 +267,27 @@ class SeismicEngine:
         }
 
 
-# Load engine at startup (so Excel is read once)
+# ============================================================
+# STARTUP
+# ============================================================
+app = FastAPI(title="Seismic Params API", version="1.0.0")
+
 try:
     ENGINE = SeismicEngine(XLS_PATH)
+    STARTUP_ERROR = None
 except Exception as e:
     ENGINE = None
     STARTUP_ERROR = str(e)
-else:
-    STARTUP_ERROR = None
-
-
-# =========================
-# FastAPI app
-# =========================
-app = FastAPI(title="Seismic Params API", version="1.0.0")
 
 
 @app.get("/health")
 def health():
     if ENGINE is None:
-        return {"ok": False, "error": STARTUP_ERROR}
-    return {"ok": True}
+        return {"ok": False, "error": STARTUP_ERROR, "xls_path": XLS_PATH}
+    return {"ok": True, "xls_path": XLS_PATH, "rows": len(ENGINE.df), "cols": len(ENGINE.df.columns)}
 
 
 def _print_table(states_sorted: List[Dict[str, Any]]) -> None:
-    # stampa tabella nei log di Render
     print("\nStato Limite\tTR [anni]\tag [g]\tFo\tTc* [s]")
     for s in states_sorted:
         print(
@@ -290,28 +318,31 @@ def seismic(items: List[SeismicRequestItem]):
         cu = CU_BY_CLASS[cls]
         vr = compute_VR(vn, cu)
 
-        neighbors = ENGINE.neighbors_4(lat, lon, k=K_NEIGHBORS)
+        neighbors = ENGINE.neighbors_k(lat, lon, k=K_NEIGHBORS)
 
-        states = []
+        states: List[Dict[str, Any]] = []
         for state, pvr in PVR_BY_STATE.items():
-            tr_calc = compute_TR(vr, pvr)
-            params = ENGINE.params_at_TR(neighbors, tr_calc)
+            tr_calc = compute_TR(vr, pvr)  # TR calcolato
+            params = ENGINE.params_at_TR(neighbors, tr_calc)  # interp (se serve) tra TR disponibili
+
             states.append({
                 "state": state,
-                "PVR": pvr,
+                "PVR": float(pvr),
                 "VN": vn,
-                "CU": cu,
-                "VR": vr,
-                "TR": tr_calc,
-                "TR_low": params["TR_low"],
-                "TR_high": params["TR_high"],
-                "alpha": params["alpha"],
-                "ag_g": params["ag_g"],
-                "F0": params["F0"],
-                "Tc_star": params["Tc_star"],
+                "CU": float(cu),
+                "VR": float(vr),
+                "TR": float(tr_calc),
+                "TR_low": int(params["TR_low"]),
+                "TR_high": int(params["TR_high"]),
+                "alpha": float(params["alpha"]),
+                "ag_g": float(params["ag_g"]),
+                "F0": float(params["F0"]),
+                "Tc_star": float(params["Tc_star"]),
             })
 
         states_sorted = sorted(states, key=lambda s: STATE_ORDER.index(s["state"]))
+
+        # stampa a log SEMPRE
         _print_table(states_sorted)
 
         out_all.append({
@@ -319,16 +350,18 @@ def seismic(items: List[SeismicRequestItem]):
             "lon": lon,
             "vn": vn,
             "class": cls,
-            "cu": cu,
-            "vr": vr,
+            "cu": float(cu),
+            "vr": float(vr),
             "nearest_points": [asdict(n) for n in neighbors],
             "states": states_sorted,
             "meta": {
                 "AG_UNIT": AG_UNIT,
+                "ag_conversion": "ag_g = ag_ms2 / 9.81",
                 "TR_available": TR_AVAILABLE,
                 "k_neighbors": K_NEIGHBORS,
                 "idw_power": IDW_POWER,
                 "projection_meters": PROJ_METERS[1],
+                "xls_path": XLS_PATH,
             },
         })
 
