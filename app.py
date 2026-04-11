@@ -39,15 +39,15 @@ TR_AVAILABLE = [30, 50, 72, 101, 140, 201, 475, 975, 2475]
 # TR 30: ag col 5; F0 col 6; Tc col 7, ecc.
 # Convertiamo in 0-based per pandas.iat
 TR_TO_COLS_0B: Dict[int, Tuple[int, int, int]] = {
-    30:  (5 - 1, 6 - 1, 7 - 1),
-    50:  (8 - 1, 9 - 1, 10 - 1),
-    72:  (11 - 1, 12 - 1, 13 - 1),
-    101: (14 - 1, 15 - 1, 16 - 1),
-    140: (17 - 1, 18 - 1, 19 - 1),
-    201: (20 - 1, 21 - 1, 22 - 1),
-    475: (23 - 1, 24 - 1, 25 - 1),
-    975: (26 - 1, 27 - 1, 28 - 1),
-    2475:(29 - 1, 30 - 1, 31 - 1),
+    30:   (5 - 1, 6 - 1, 7 - 1),
+    50:   (8 - 1, 9 - 1, 10 - 1),
+    72:   (11 - 1, 12 - 1, 13 - 1),
+    101:  (14 - 1, 15 - 1, 16 - 1),
+    140:  (17 - 1, 18 - 1, 19 - 1),
+    201:  (20 - 1, 21 - 1, 22 - 1),
+    475:  (23 - 1, 24 - 1, 25 - 1),
+    975:  (26 - 1, 27 - 1, 28 - 1),
+    2475: (29 - 1, 30 - 1, 31 - 1),
 }
 
 # CU per classe d'uso
@@ -67,12 +67,16 @@ class SeismicRequestItem(BaseModel):
     vn: float = Field(..., gt=0, description="Vita nominale [anni]")
     class_: str = Field(..., alias="class", description="Classe d'uso: I, II, III, IV")
 
-    # AGGIUNTA MINIMA:
-    # opzionale, se passato restituisce anche lo spettro a TR_custom
-    tr_custom: Optional[float] = Field(
+    # nuovi campi opzionali per lo spettro custom
+    stato_limite: Optional[str] = Field(
         default=None,
-        alias="TR_custom",
-        description="Tempo di ritorno personalizzato [anni]"
+        alias="statoLimite",
+        description="Stato limite richiesto: SLO, SLD, SLV, SLC"
+    )
+
+    miglioramento: Optional[float] = Field(
+        default=None,
+        description="Miglioramento richiesto in percento, es. 80 = 80%"
     )
 
     class Config:
@@ -107,6 +111,64 @@ def compute_VR(vn: float, cu: float) -> float:
 def compute_TR(vr: float, pvr: float) -> float:
     # TR = -VR / ln(1 - PVR)
     return -float(vr) / math.log(1.0 - float(pvr))
+
+
+def compute_pvr_from_tr(vr: float, tr: float) -> float:
+    return 1.0 - math.exp(-float(vr) / float(tr))
+
+
+def compute_tr_from_pvr(vr: float, pvr: float) -> float:
+    if pvr <= 0 or pvr >= 1:
+        raise ValueError("PVR deve stare tra 0 e 1")
+    return -float(vr) / math.log(1.0 - float(pvr))
+
+
+def compute_tr_custom_from_miglioramento(
+    vr: float,
+    pvr_base: float,
+    miglioramento_percent: float
+) -> Tuple[float, float]:
+    """
+    Restituisce:
+    - TR_custom
+    - PVR_custom
+
+    NOTA:
+    Questa è una legge provvisoria e separata apposta,
+    così puoi cambiarla facilmente quando avrete la formulazione definitiva.
+    """
+    zeta = float(miglioramento_percent) / 100.0
+
+    if zeta <= 0:
+        raise ValueError("Il miglioramento deve essere > 0")
+
+    if zeta > 100:
+        raise ValueError("Il miglioramento non può superare 100")
+
+    # ==========================================================
+    # LEGGE PROVVISORIA
+    # ==========================================================
+    # zeta = miglioramento / 100
+    # zeta = 1.0 -> nessuna riduzione rispetto allo stato limite base
+    # zeta < 1.0 -> domanda ridotta -> PVR_custom aumenta -> TR_custom diminuisce
+    #
+    # scelta provvisoria:
+    #   PVR_custom = PVR_base / zeta
+    #
+    # Esempio:
+    #   SLV base -> PVR_base = 0.10
+    #   zeta = 0.80 -> PVR_custom = 0.125
+    #
+    # Da sostituire quando avrete la legge finale condivisa con l'azienda.
+    # ==========================================================
+    pvr_custom = pvr_base / zeta
+
+    # limiti numerici
+    pvr_custom = max(1e-6, min(0.999999, pvr_custom))
+
+    tr_custom = compute_tr_from_pvr(vr, pvr_custom)
+
+    return float(tr_custom), float(pvr_custom)
 
 
 def idw(values: np.ndarray, distances: np.ndarray, p: float = 2.0) -> Tuple[float, np.ndarray]:
@@ -276,7 +338,7 @@ class SeismicEngine:
 # ============================================================
 # STARTUP
 # ============================================================
-app = FastAPI(title="Seismic Params API", version="1.0.0")
+app = FastAPI(title="Seismic Params API", version="1.1.0")
 
 try:
     ENGINE = SeismicEngine(XLS_PATH)
@@ -290,7 +352,12 @@ except Exception as e:
 def health():
     if ENGINE is None:
         return {"ok": False, "error": STARTUP_ERROR, "xls_path": XLS_PATH}
-    return {"ok": True, "xls_path": XLS_PATH, "rows": len(ENGINE.df), "cols": len(ENGINE.df.columns)}
+    return {
+        "ok": True,
+        "xls_path": XLS_PATH,
+        "rows": len(ENGINE.df),
+        "cols": len(ENGINE.df.columns)
+    }
 
 
 def _print_table(states_sorted: List[Dict[str, Any]]) -> None:
@@ -317,13 +384,24 @@ def seismic(items: List[SeismicRequestItem]):
         lon = float(it.lon)
         vn = float(it.vn)
         cls = str(it.class_).strip().upper()
-        tr_custom = it.tr_custom
+        stato_limite = str(it.stato_limite).strip().upper() if it.stato_limite is not None else None
+        miglioramento = float(it.miglioramento) if it.miglioramento is not None else None
 
         if cls not in CU_BY_CLASS:
             raise HTTPException(status_code=400, detail=f"Invalid class '{cls}'. Use I, II, III, IV")
 
-        if tr_custom is not None and float(tr_custom) <= 0:
-            raise HTTPException(status_code=400, detail="TR_custom must be > 0")
+        if stato_limite is not None and stato_limite not in PVR_BY_STATE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid statoLimite '{stato_limite}'. Use SLO, SLD, SLV, SLC"
+            )
+
+        if miglioramento is not None:
+            if miglioramento <= 0 or miglioramento > 100:
+                raise HTTPException(
+                    status_code=400,
+                    detail="miglioramento must be > 0 and <= 100"
+                )
 
         cu = CU_BY_CLASS[cls]
         vr = compute_VR(vn, cu)
@@ -372,17 +450,42 @@ def seismic(items: List[SeismicRequestItem]):
                 "idw_power": IDW_POWER,
                 "projection_meters": PROJ_METERS[1],
                 "xls_path": XLS_PATH,
+                "custom_rule_note": "TR_custom calcolato da miglioramento tramite legge provvisoria separata nel backend"
             },
         }
 
         # ====================================================
-        # AGGIUNTA MINIMA:
-        # se TR_custom è passato, aggiungo anche lo spettro custom
-        # senza toccare il comportamento attuale
+        # CUSTOM SPECTRUM
         # ====================================================
-        if tr_custom is not None:
-            custom_params = ENGINE.params_at_TR(neighbors, float(tr_custom))
-            result_item["custom_spectrum"] = {
+        custom_spectrum = None
+
+        if stato_limite is not None and miglioramento is not None:
+            state_selected = next((s for s in states_sorted if s["state"] == stato_limite), None)
+
+            if state_selected is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"State '{stato_limite}' not found"
+                )
+
+            pvr_base = float(state_selected["PVR"])
+            tr_base = float(state_selected["TR"])
+
+            tr_custom, pvr_custom = compute_tr_custom_from_miglioramento(
+                vr=vr,
+                pvr_base=pvr_base,
+                miglioramento_percent=miglioramento
+            )
+
+            custom_params = ENGINE.params_at_TR(neighbors, tr_custom)
+
+            custom_spectrum = {
+                "state": stato_limite,
+                "miglioramento_percent": float(miglioramento),
+                "zeta_target": float(miglioramento) / 100.0,
+                "PVR_base": pvr_base,
+                "PVR_custom": pvr_custom,
+                "TR_base": tr_base,
                 "TR": float(custom_params["TR_target"]),
                 "TR_low": int(custom_params["TR_low"]),
                 "TR_high": int(custom_params["TR_high"]),
@@ -391,6 +494,8 @@ def seismic(items: List[SeismicRequestItem]):
                 "F0": float(custom_params["F0"]),
                 "Tc_star": float(custom_params["Tc_star"]),
             }
+
+            result_item["custom_spectrum"] = custom_spectrum
 
         out_all.append(result_item)
 
