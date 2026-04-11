@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -67,6 +67,14 @@ class SeismicRequestItem(BaseModel):
     vn: float = Field(..., gt=0, description="Vita nominale [anni]")
     class_: str = Field(..., alias="class", description="Classe d'uso: I, II, III, IV")
 
+    # AGGIUNTA MINIMA:
+    # opzionale, se passato restituisce anche lo spettro a TR_custom
+    tr_custom: Optional[float] = Field(
+        default=None,
+        alias="TR_custom",
+        description="Tempo di ritorno personalizzato [anni]"
+    )
+
     class Config:
         populate_by_name = True
 
@@ -89,7 +97,6 @@ def ag_to_g(ag_raw: float) -> float:
     """Converte ag dal file (m/s^2) in [g]."""
     if AG_UNIT.lower() == "ms2":
         return float(ag_raw) / G_STD
-    # (qui siamo fissi su ms2 come richiesto)
     return float(ag_raw)
 
 
@@ -156,7 +163,6 @@ class SeismicEngine:
         elif ext == ".xlsx":
             df = pd.read_excel(xls_path, engine="openpyxl")
         else:
-            # fallback
             df = pd.read_excel(xls_path, engine="xlrd")
 
         # 3) validate columns
@@ -311,9 +317,13 @@ def seismic(items: List[SeismicRequestItem]):
         lon = float(it.lon)
         vn = float(it.vn)
         cls = str(it.class_).strip().upper()
+        tr_custom = it.tr_custom
 
         if cls not in CU_BY_CLASS:
             raise HTTPException(status_code=400, detail=f"Invalid class '{cls}'. Use I, II, III, IV")
+
+        if tr_custom is not None and float(tr_custom) <= 0:
+            raise HTTPException(status_code=400, detail="TR_custom must be > 0")
 
         cu = CU_BY_CLASS[cls]
         vr = compute_VR(vn, cu)
@@ -322,8 +332,8 @@ def seismic(items: List[SeismicRequestItem]):
 
         states: List[Dict[str, Any]] = []
         for state, pvr in PVR_BY_STATE.items():
-            tr_calc = compute_TR(vr, pvr)  # TR calcolato
-            params = ENGINE.params_at_TR(neighbors, tr_calc)  # interp (se serve) tra TR disponibili
+            tr_calc = compute_TR(vr, pvr)
+            params = ENGINE.params_at_TR(neighbors, tr_calc)
 
             states.append({
                 "state": state,
@@ -345,7 +355,7 @@ def seismic(items: List[SeismicRequestItem]):
         # stampa a log SEMPRE
         _print_table(states_sorted)
 
-        out_all.append({
+        result_item: Dict[str, Any] = {
             "lat": lat,
             "lon": lon,
             "vn": vn,
@@ -363,6 +373,25 @@ def seismic(items: List[SeismicRequestItem]):
                 "projection_meters": PROJ_METERS[1],
                 "xls_path": XLS_PATH,
             },
-        })
+        }
+
+        # ====================================================
+        # AGGIUNTA MINIMA:
+        # se TR_custom è passato, aggiungo anche lo spettro custom
+        # senza toccare il comportamento attuale
+        # ====================================================
+        if tr_custom is not None:
+            custom_params = ENGINE.params_at_TR(neighbors, float(tr_custom))
+            result_item["custom_spectrum"] = {
+                "TR": float(custom_params["TR_target"]),
+                "TR_low": int(custom_params["TR_low"]),
+                "TR_high": int(custom_params["TR_high"]),
+                "alpha": float(custom_params["alpha"]),
+                "ag_g": float(custom_params["ag_g"]),
+                "F0": float(custom_params["F0"]),
+                "Tc_star": float(custom_params["Tc_star"]),
+            }
+
+        out_all.append(result_item)
 
     return out_all
